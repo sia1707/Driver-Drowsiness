@@ -9,33 +9,24 @@ import random
 import threading
 import pygame
 
-# ---------------------------------------------------------
-# Setup & Configuration
-# ---------------------------------------------------------
+# Initialize Pygame for the continuous beep
 pygame.mixer.init()
 pygame.mixer.music.load('/System/Library/Sounds/Ping.aiff') 
 
-EAR_THRESHOLD = 0.25      
-EAR_CONSEC_FRAMES = 15    
-MAR_THRESHOLD = 0.6       
+# Updated Thresholds to reduce false alerts
+EAR_THRESHOLD = 0.20       # Lowered from 0.25 (requires tighter eye closure)
+EAR_CONSEC_FRAMES = 20     # Increased from 15 (waits slightly longer before alarming)
+MAR_THRESHOLD = 0.6
 MAR_CONSEC_FRAMES = 15    
 
-# Calibration Variables
-frame_count = 0
-calibration_ear_list = []
-is_calibrated = False
-
-# Counters, FPS, and Alarm State
-blink_counter = 0
-yawn_counter = 0
-pTime = 0
-is_drowsy = False  
-alarm_on = False
-
-# MediaPipe Indices
+# MediaPipe FaceMesh indices
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 MOUTH = [78, 13, 308, 14]
+
+# Global state for audio threading
+is_drowsy = False
+alarm_on = False
 
 def calculate_ear(eye_points):
     A = dist.euclidean(eye_points[1], eye_points[5])
@@ -48,191 +39,142 @@ def calculate_mar(mouth_points):
     B = dist.euclidean(mouth_points[0], mouth_points[2])
     return A / (B + 1e-6)
 
-# ---------------------------------------------------------
-# AI Voice Thread
-# ---------------------------------------------------------
 def play_voice_alert():
-    """Runs in the background and speaks phrases while drowsy"""
     global is_drowsy
-    
     phrases = [
         "Wake up! Don't sleep!",
         "There's a long journey ahead, wake up!",
         "Keep your eyes on the road!",
         "Danger! Please open your eyes!",
-        "Wake up! Pull over if you are tired!"
+        "Wake up! Pull over if you feel sleepy!" # Fixed pronunciation
     ]
-    
+    # Voice keeps firing sentences as long as eyes remain closed
     while is_drowsy:
-        phrase = random.choice(phrases)
-        os.system(f"say '{phrase}'")
+        os.system(f"say '{random.choice(phrases)}'")
         time.sleep(0.1)
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+def main():
+    global is_drowsy, alarm_on
+    
+    # Set to 1 to bypass iPhone Continuity Camera. 
+    # Change back to 0 if your iPhone is totally disconnected.
+    cap = cv2.VideoCapture(1) 
+    
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
 
-# Start Video Capture
-cap = cv2.VideoCapture(0)
+    blink_counter = 0
+    frame_count = 0
+    calibration_ear_list = []
+    is_calibrated = False
+    current_ear_thresh = EAR_THRESHOLD
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("ERROR: Could not read from the camera.")
-        break
+    print("Starting camera... Press 'q' to quit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
         
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
-    
-    # ---------------------------------------------------------
-    # 1. Analyze Room Brightness 
-    # ---------------------------------------------------------
-    # Check how dark the raw room is before we enhance it
-    raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    avg_brightness = np.mean(raw_gray)
-    is_dark = avg_brightness < 60  # If average pixel brightness is below 60, it's dark
-    
-    # ---------------------------------------------------------
-    # 2. Software Night Vision Enhancer
-    # ---------------------------------------------------------
-    brightened = cv2.convertScaleAbs(frame, alpha=1.5, beta=40)
-    gray = cv2.cvtColor(brightened, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced_gray = clahe.apply(gray)
-    frame = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
-    
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_frame)
-    
-    current_drowsy_state = False 
-    danger_reason = "" 
-    
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            landmarks = [(int(pt.x * w), int(pt.y * h)) for pt in face_landmarks.landmark]
-            
-            left_eye_pts = [landmarks[i] for i in LEFT_EYE]
-            right_eye_pts = [landmarks[i] for i in RIGHT_EYE]
-            mouth_pts = [landmarks[i] for i in MOUTH]
-            
-            ear = (calculate_ear(left_eye_pts) + calculate_ear(right_eye_pts)) / 2.0
-            mar = calculate_mar(mouth_pts)
-            chin_y = face_landmarks.landmark[152].y
-            
-            cv2.polylines(frame, [np.array(left_eye_pts)], True, (255, 100, 0), 1)
-            cv2.polylines(frame, [np.array(right_eye_pts)], True, (255, 100, 0), 1)
-            cv2.polylines(frame, [np.array(mouth_pts)], True, (255, 100, 0), 1)
-
-            # Auto-Calibration Phase
-            if not is_calibrated:
-                frame_count += 1
-                calibration_ear_list.append(ear)
+        # Night Vision / Low Light Check
+        raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        is_dark = np.mean(raw_gray) < 60
+        
+        # Apply brightening filters
+        brightened = cv2.convertScaleAbs(frame, alpha=1.5, beta=40)
+        gray = cv2.cvtColor(brightened, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        processed_frame = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+        
+        results = face_mesh.process(cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB))
+        
+        current_drowsy_state = False
+        danger_reason = ""
+        
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                landmarks = [(int(pt.x * w), int(pt.y * h)) for pt in face_landmarks.landmark]
                 
-                cv2.putText(frame, "SYSTEM CALIBRATING", (w//2 - 150, h//2 - 20), 
-                            cv2.FONT_HERSHEY_TRIPLEX, 0.8, (0, 255, 255), 2)
-                cv2.putText(frame, "PLEASE LOOK FORWARD", (w//2 - 160, h//2 + 20), 
-                            cv2.FONT_HERSHEY_TRIPLEX, 0.8, (0, 255, 255), 2)
+                left_eye_pts = [landmarks[i] for i in LEFT_EYE]
+                right_eye_pts = [landmarks[i] for i in RIGHT_EYE]
+                mouth_pts = [landmarks[i] for i in MOUTH]
                 
-                if frame_count >= 100:
-                    avg_ear = sum(calibration_ear_list) / len(calibration_ear_list)
-                    EAR_THRESHOLD = avg_ear * 0.75
-                    is_calibrated = True
+                ear = (calculate_ear(left_eye_pts) + calculate_ear(right_eye_pts)) / 2.0
+                mar = calculate_mar(mouth_pts)
+                chin_y = face_landmarks.landmark[152].y
+                
+                # Draw facial tracking points
+                cv2.polylines(frame, [np.array(left_eye_pts)], True, (255, 100, 0), 1)
+                cv2.polylines(frame, [np.array(right_eye_pts)], True, (255, 100, 0), 1)
+                cv2.polylines(frame, [np.array(mouth_pts)], True, (255, 100, 0), 1)
 
-            # Detection Phase
-            else:
-                if ear < EAR_THRESHOLD:
-                    blink_counter += 1
-                    if blink_counter >= EAR_CONSEC_FRAMES:
-                        current_drowsy_state = True 
-                        danger_reason = "EYES CLOSED"
+                # Auto-Calibration Sequence (First 100 frames)
+                if not is_calibrated:
+                    frame_count += 1
+                    calibration_ear_list.append(ear)
+                    cv2.putText(frame, "CALIBRATING... LOOK FORWARD", (w//2 - 200, h//2), 
+                                cv2.FONT_HERSHEY_TRIPLEX, 0.8, (0, 255, 255), 2)
+                    if frame_count >= 100:
+                        avg_ear = sum(calibration_ear_list) / len(calibration_ear_list)
+                        current_ear_thresh = avg_ear * 0.75 # Sets threshold to 75% of normal open-eye EAR
+                        is_calibrated = True
                 else:
-                    blink_counter = 0
+                    # Logic for drowsy detection
+                    if ear < current_ear_thresh:
+                        blink_counter += 1
+                        if blink_counter >= EAR_CONSEC_FRAMES:
+                            current_drowsy_state = True
+                            danger_reason = "EYES CLOSED"
+                    else:
+                        blink_counter = 0
 
-                if chin_y > 0.85: 
-                    current_drowsy_state = True  
-                    danger_reason = "HEAD DROPPING"
+                    if chin_y > 0.85: # Head dropping check
+                        current_drowsy_state = True
+                        danger_reason = "HEAD DROPPING"
+                        
+                    # Display metrics
+                    cv2.putText(frame, f"EAR: {ear:.2f}", (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Thresh: {current_ear_thresh:.2f}", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                if mar > MAR_THRESHOLD:
-                    yawn_counter += 1
-                    if yawn_counter >= MAR_CONSEC_FRAMES:
-                        cv2.putText(frame, "WARNING: YAWNING DETECTED", (20, h - 60), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                else:
-                    yawn_counter = 0
-                    
-            cv2.putText(frame, f"EAR: {ear:.2f} | THRESH: {EAR_THRESHOLD:.2f}", (10, 30), 
-                        cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 255, 255), 1)
-            cv2.putText(frame, f"MAR: {mar:.2f}", (10, 50), 
-                        cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 255, 255), 1)
+        # Update global state for the audio thread
+        is_drowsy = current_drowsy_state
 
-    is_drowsy = current_drowsy_state
+        # Handle UI and Alarms
+        if is_drowsy:
+            # Pulsing red screen overlay
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1) 
+            alpha = 0.4 + 0.2 * math.sin(time.time() * 12) 
+            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+            
+            cv2.putText(frame, f"DANGER: {danger_reason}!", (50, h//2), 
+                        cv2.FONT_HERSHEY_TRIPLEX, 1.2, (255, 255, 255), 3)
 
-    # ---------------------------------------------------------
-    # 3. Cinematic UI Overlay & Audio Triggers
-    # ---------------------------------------------------------
-    if is_drowsy:
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1) 
-        alpha = 0.4 + 0.2 * math.sin(time.time() * 12) 
-        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-        
-        thickness = 15
-        color = (0, 0, 255)
-        cv2.line(frame, (0, 0), (100, 0), color, thickness)
-        cv2.line(frame, (0, 0), (0, 100), color, thickness)
-        cv2.line(frame, (w, 0), (w-100, 0), color, thickness)
-        cv2.line(frame, (w, 0), (w, 100), color, thickness)
-        cv2.line(frame, (0, h), (100, h), color, thickness)
-        cv2.line(frame, (0, h), (0, h-100), color, thickness)
-        cv2.line(frame, (w, h), (w-100, h), color, thickness)
-        cv2.line(frame, (w, h), (w, h-100), color, thickness)
+            if not alarm_on:
+                pygame.mixer.music.play(-1) # Start continuous beep
+                threading.Thread(target=play_voice_alert, daemon=True).start() # Start voice
+                alarm_on = True
+        else:
+            if alarm_on:
+                pygame.mixer.music.stop() # Instantly cut off beep when eyes open
+                alarm_on = False
 
-        font = cv2.FONT_HERSHEY_TRIPLEX
-        alert_text = f"DANGER: {danger_reason}!"
-        text_size = cv2.getTextSize(alert_text, font, 1.3, 3)[0]
-        text_x = (w - text_size[0]) // 2
-        text_y = (h + text_size[1]) // 2
-        cv2.putText(frame, alert_text, (text_x, text_y), font, 1.3, (0, 0, 0), 8)
-        cv2.putText(frame, alert_text, (text_x, text_y), font, 1.3, (255, 255, 255), 3)
+        # Apply screen flashlight white border if room is dark
+        if is_dark:
+            frame = cv2.copyMakeBorder(frame, 50, 50, 50, 50, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+            cv2.putText(frame, "LOW LIGHT MODE ACTIVE", (60, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        if not alarm_on:
-            pygame.mixer.music.play(-1) 
-            threading.Thread(target=play_voice_alert, daemon=True).start()
-            alarm_on = True
-    else:
-        if alarm_on:
-            pygame.mixer.music.stop() 
-            alarm_on = False
+        cv2.imshow("Driver Drowsiness Detector", frame)
 
-    # FPS Counter
-    cTime = time.time()
-    fps = 1 / (cTime - pTime)
-    pTime = cTime
-    cv2.putText(frame, f"FPS: {int(fps)}", (10, h - 20), cv2.FONT_HERSHEY_PLAIN, 1.2, (0, 255, 0), 1)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    # ---------------------------------------------------------
-    # 4. The Screen Flashlight Hack
-    # ---------------------------------------------------------
-    # If the room is dark, pad the entire frame with a massive white border
-    if is_dark:
-        b_size = 250  # Thickness of the white light border in pixels
-        frame = cv2.copyMakeBorder(frame, b_size, b_size, b_size, b_size, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-        
-        # Add indicator text in the white border
-        cv2.putText(frame, "AUTOMATIC SCREEN ILLUMINATION ON", (50, 100), 
-                    cv2.FONT_HERSHEY_TRIPLEX, 1.2, (0, 0, 255), 3)
+    cap.release()
+    cv2.destroyAllWindows()
+    pygame.mixer.music.stop()
 
-    cv2.imshow("Emergency Driver Monitor", frame)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-pygame.mixer.music.stop()
-pygame.quit()
+if __name__ == "__main__":
+    main()
